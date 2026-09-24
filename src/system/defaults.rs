@@ -520,21 +520,47 @@ mod macos {
         }
     }
 
+    /// Sandboxed apps read preferences from their container, which Core Foundation only
+    /// resolves for the app itself; other processes must address the plist by path.
+    pub(super) fn sandboxed_application(
+        home: &std::path::Path,
+        domain: &str,
+        host: HostScope,
+    ) -> Option<std::path::PathBuf> {
+        if domain.contains('/') {
+            return None;
+        }
+        let prefs = home
+            .join("Library/Containers")
+            .join(domain)
+            .join("Data/Library/Preferences");
+        if !prefs.join(format!("{domain}.plist")).is_file() {
+            return None;
+        }
+        Some(match host {
+            HostScope::Any => prefs.join(domain),
+            HostScope::Current => prefs.join("ByHost").join(domain),
+        })
+    }
+
     fn application_id(
         domain: &str,
+        host: HostScope,
     ) -> (Option<CFString>, core_foundation_sys::string::CFStringRef) {
         if canonical_domain(domain) == "NSGlobalDomain" {
-            (None, unsafe { kCFPreferencesAnyApplication })
-        } else {
-            let domain = CFString::new(domain);
-            let reference = domain.as_concrete_TypeRef();
-            (Some(domain), reference)
+            return (None, unsafe { kCFPreferencesAnyApplication });
         }
+        let application = match sandboxed_application(&crate::dirs::HOME, domain, host) {
+            Some(path) => CFString::new(&path.to_string_lossy()),
+            None => CFString::new(domain),
+        };
+        let reference = application.as_concrete_TypeRef();
+        (Some(application), reference)
     }
 
     pub(super) fn read(domain: &str, key: &str, host: HostScope) -> Result<Option<plist::Value>> {
         let key = CFString::new(key);
-        let (_application, application_id) = application_id(domain);
+        let (_application, application_id) = application_id(domain, host);
         let value = unsafe {
             CFPreferencesCopyValue(
                 key.as_concrete_TypeRef(),
@@ -560,7 +586,7 @@ mod macos {
             .map_err(|err| eyre::eyre!("failed to parse macOS preference: {err}"))?;
         let value = unsafe { CFPropertyList::wrap_under_create_rule(value) };
         let key = CFString::new(key);
-        let (_application, application_id) = application_id(domain);
+        let (_application, application_id) = application_id(domain, host);
         unsafe {
             CFPreferencesSetValue(
                 key.as_concrete_TypeRef(),
@@ -574,7 +600,7 @@ mod macos {
     }
 
     fn synchronize(domain: &str, host: HostScope) -> Result<()> {
-        let (_application, application_id) = application_id(domain);
+        let (_application, application_id) = application_id(domain, host);
         unsafe {
             if CFPreferencesSynchronize(application_id, kCFPreferencesCurrentUser, host_id(host))
                 == 0
@@ -601,7 +627,7 @@ mod macos {
     #[cfg(test)]
     pub(super) fn remove(domain: &str, key: &str, host: HostScope) -> Result<()> {
         let key = CFString::new(key);
-        let (_application, application_id) = application_id(domain);
+        let (_application, application_id) = application_id(domain, host);
         unsafe {
             CFPreferencesSetValue(
                 key.as_concrete_TypeRef(),
@@ -1092,5 +1118,79 @@ mod tests {
 
         assert_eq!(current.unwrap(), Some(value.to_plist()));
         cleanup.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_sandboxed_application_uses_existing_container() {
+        let home = tempfile::tempdir().unwrap();
+        let domain = "com.example.Sandboxed";
+        assert_eq!(
+            macos::sandboxed_application(home.path(), domain, HostScope::Any),
+            None
+        );
+
+        let prefs = home
+            .path()
+            .join("Library/Containers")
+            .join(domain)
+            .join("Data/Library/Preferences");
+        std::fs::create_dir_all(&prefs).unwrap();
+        std::fs::write(prefs.join(format!("{domain}.plist")), "").unwrap();
+        assert_eq!(
+            macos::sandboxed_application(home.path(), domain, HostScope::Any),
+            Some(prefs.join(domain))
+        );
+        assert_eq!(
+            macos::sandboxed_application(home.path(), domain, HostScope::Current),
+            Some(prefs.join("ByHost").join(domain))
+        );
+        assert_eq!(
+            macos::sandboxed_application(home.path(), "/tmp/elsewhere", HostScope::Any),
+            None
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_sandboxed_round_trip_writes_container() {
+        let domain = format!("com.mise.sandbox-test.{}", uuid::Uuid::now_v7());
+        let container = crate::dirs::HOME.join("Library/Containers").join(&domain);
+        let prefs = container.join("Data/Library/Preferences");
+        let container_plist = prefs.join(format!("{domain}.plist"));
+        let unsandboxed_plist = crate::dirs::HOME
+            .join("Library/Preferences")
+            .join(format!("{domain}.plist"));
+        std::fs::create_dir_all(&prefs).unwrap();
+        plist::Value::Dictionary(Default::default())
+            .to_file_xml(&container_plist)
+            .unwrap();
+        let request = DefaultsRequest {
+            dock_apps: false,
+            host: HostScope::Any,
+            path: None,
+            domain: domain.clone(),
+            key: "Sandboxed".into(),
+            value: DefaultsValue::Bool(true),
+        };
+
+        let result = (|| -> Result<()> {
+            write_all(std::slice::from_ref(&request))?;
+            assert_eq!(
+                status_sync(std::slice::from_ref(&request))?[0].state,
+                DefaultsState::Set
+            );
+            let written = plist::Value::from_file(&container_plist)?;
+            assert_eq!(
+                written.as_dictionary().unwrap().get("Sandboxed"),
+                Some(&plist::Value::Boolean(true))
+            );
+            assert!(!unsandboxed_plist.exists());
+            Ok(())
+        })();
+        macos::remove(&domain, "Sandboxed", HostScope::Any).unwrap();
+        std::fs::remove_dir_all(&container).unwrap();
+        let _ = std::fs::remove_file(&unsandboxed_plist);
+        result.unwrap();
     }
 }

@@ -207,6 +207,15 @@ type and is also not supported.
 User defaults are per-user, so unlike system packages they never involve
 sudo. `sudo defaults` system domains are not supported.
 
+## Sandboxed apps
+
+Sandboxed apps such as Safari keep their preferences in
+`~/Library/Containers/<domain>/Data/Library/Preferences/<domain>.plist`, not
+`~/Library/Preferences`. When that file exists, mise reads and writes the
+container, and current-host entries use its `ByHost` folder, the same files
+`defaults` uses. An app that has never been launched has no container yet, so
+launch it once before applying its defaults.
+
 ## Current-host preferences
 
 Use an explicit entry for preferences normally written with `defaults -currentHost`:
